@@ -1,6 +1,7 @@
 'use strict';
 
 const Http = require('http');
+const Http2 = require('http2');
 const Net = require('net');
 const Stream = require('stream');
 const Url = require('url');
@@ -15,6 +16,7 @@ const Lab = require('@hapi/lab');
 const Teamwork = require('@hapi/teamwork');
 const Wreck = require('@hapi/wreck');
 
+const Common = require('./common');
 
 const internals = {};
 
@@ -122,35 +124,170 @@ describe('Request.Generator', () => {
 
 describe('Request', () => {
 
-    it('sets client address', async () => {
+    it('sets host and hostname', async () => {
 
         const server = Hapi.server();
 
         const handler = (request) => {
 
-            let expectedClientAddress = '127.0.0.1';
-            if (Net.isIPv6(server.listener.address().address)) {
-                expectedClientAddress = '::ffff:127.0.0.1';
-            }
+            return [request.info.host, request.info.hostname].join('|');
+        };
 
-            expect(request.info.remoteAddress).to.equal(expectedClientAddress);
-            expect(request.info.remotePort).to.be.above(0);
+        server.route({ method: 'GET', path: '/', handler });
+
+        const res1 = await server.inject({ url: '/', headers: { host: 'host' } });
+        expect(res1.payload).to.equal('host|host');
+
+        const res2 = await server.inject({ url: '/', headers: { host: 'host:123' } });
+        expect(res2.payload).to.equal('host:123|host');
+
+        const res3 = await server.inject({ url: '/', headers: { host: '127.0.0.1' } });
+        expect(res3.payload).to.equal('127.0.0.1|127.0.0.1');
+
+        const res4 = await server.inject({ url: '/', headers: { host: '127.0.0.1:123' } });
+        expect(res4.payload).to.equal('127.0.0.1:123|127.0.0.1');
+
+        const res5 = await server.inject({ url: '/', headers: { host: '[::1]' } });
+        expect(res5.payload).to.equal('[::1]|[::1]');
+
+        const res6 = await server.inject({ url: '/', headers: { host: '[::1]:123' } });
+        expect(res6.payload).to.equal('[::1]:123|[::1]');
+    });
+
+    it('sets client address (default)', async (flags) => {
+
+        const server = Hapi.server();
+
+        const handler = (request) => {
 
             // Call twice to reuse cached values
 
-            expect(request.info.remoteAddress).to.equal(expectedClientAddress);
+            if (Common.hasIPv6) {
+                // 127.0.0.1 on node v14 and v16, ::1 on node v18 since DNS resolved to IPv6.
+                expect(request.info.remoteAddress).to.match(/^127\.0\.0\.1|::1$/);
+                expect(request.info.remoteAddress).to.match(/^127\.0\.0\.1|::1$/);
+            }
+            else {
+                expect(request.info.remoteAddress).to.equal('127.0.0.1');
+                expect(request.info.remoteAddress).to.equal('127.0.0.1');
+            }
+
+            expect(request.info.remotePort).to.be.above(0);
             expect(request.info.remotePort).to.be.above(0);
 
             return 'ok';
         };
 
-        server.route({ method: 'GET', path: '/', handler });
+        server.route({ method: 'get', path: '/', handler });
 
         await server.start();
+        flags.onCleanup = () => server.stop();
 
         const { payload } = await Wreck.get('http://localhost:' + server.info.port);
         expect(payload.toString()).to.equal('ok');
-        await server.stop();
+    });
+
+    it('sets client address (ipv4)', async (flags) => {
+
+        const server = Hapi.server();
+
+        const handler = (request) => {
+
+            Object.defineProperty(request.raw.req.socket, 'remoteAddress', {
+                value: '100.100.100.100'
+            });
+
+            return request.info.remoteAddress;
+        };
+
+        server.route({ method: 'get', path: '/', handler });
+
+        await server.start();
+        flags.onCleanup = () => server.stop();
+
+        const { payload } = await Wreck.get('http://localhost:' + server.info.port);
+        expect(payload.toString()).to.equal('100.100.100.100');
+    });
+
+    it('sets client address (ipv6)', async (flags) => {
+
+        const server = Hapi.server();
+
+        const handler = (request) => {
+
+            Object.defineProperty(request.raw.req.socket, 'remoteAddress', {
+                value: '::ffff:0:0:0:0:1'
+            });
+
+            return request.info.remoteAddress;
+        };
+
+        server.route({ method: 'get', path: '/', handler });
+
+        await server.start();
+        flags.onCleanup = () => server.stop();
+
+        const { payload } = await Wreck.get('http://localhost:' + server.info.port);
+        expect(payload.toString()).to.equal('::ffff:0:0:0:0:1');
+    });
+
+    it('sets client address (ipv4-mapped ipv6)', async (flags) => {
+
+        const server = Hapi.server();
+
+        const handler = (request) => {
+
+            Object.defineProperty(request.raw.req.socket, 'remoteAddress', {
+                value: '::ffff:100.100.100.100'
+            });
+
+            return request.info.remoteAddress;
+        };
+
+        server.route({ method: 'get', path: '/', handler });
+
+        await server.start();
+        flags.onCleanup = () => server.stop();
+
+        const { payload } = await Wreck.get('http://localhost:' + server.info.port);
+        expect(payload.toString()).to.equal('100.100.100.100');
+    });
+
+    it('sets client address to nothing when not available', async (flags) => {
+
+        const server = Hapi.server();
+        const abortedReqTeam = new Teamwork.Team();
+        let remoteAddr = 'not executed';
+
+        server.route({
+            method: 'GET',
+            path: '/',
+            options: {
+                handler: async (request, h) => {
+
+                    req.destroy();
+
+                    while (request.active()) {
+                        await Hoek.wait(5);
+                    }
+
+                    abortedReqTeam.attend();
+
+                    remoteAddr = request.info.remoteAddress;
+                    return null;
+                }
+            }
+        });
+
+        await server.start();
+        flags.onCleanup = () => server.stop();
+
+        const req = Http.get(server.info.uri, Hoek.ignore);
+        req.on('error', Hoek.ignore);
+
+        await abortedReqTeam.work;
+
+        expect(remoteAddr).to.equal(undefined);
     });
 
     it('sets port to nothing when not available', async () => {
@@ -274,6 +411,263 @@ describe('Request', () => {
         expect(res.result).to.equal('ok');
     });
 
+    describe('info.host', () => {
+
+        it('sets host info from :authority header when host header is absent', async () => {
+
+            const server = Hapi.server();
+            server.route({ method: 'GET', path: '/', handler: (request) => `${request.info.host}|${request.info.hostname}` });
+
+            const res = await server.inject({ url: '/', headers: { host: '', ':authority': 'example.com:8080' } });
+            expect(res.statusCode).to.equal(200);
+            expect(res.result).to.equal('example.com:8080|example.com');
+        });
+
+        it('ignores the host header when the request target is in absolute-form', async () => {
+
+            // RFC 9112 3.2.2 - an origin server MUST ignore host and use the request-target's authority
+
+            const server = Hapi.server();
+            server.route({ method: 'GET', path: '/', handler: (request) => `${request.info.host}|${request.info.hostname}` });
+
+            await server.start();
+
+            const socket = Net.createConnection(server.info.port, '127.0.0.1', () => {
+
+                socket.write('GET http://internal.example/ HTTP/1.1\r\nHost: public.example\r\nConnection: close\r\n\r\n');
+            });
+
+            let response = '';
+            socket.on('data', (chunk) => {
+
+                response += chunk.toString();
+            });
+
+            await Events.once(socket, 'close');
+            await server.stop();
+
+            expect(response).to.endWith('internal.example|internal.example');
+        });
+
+        it('accepts matching host and :authority headers regardless of case and whitespace', async () => {
+
+            const server = Hapi.server();
+            server.route({ method: 'GET', path: '/', handler: (request) => `${request.info.host}|${request.info.hostname}` });
+
+            const res = await server.inject({ url: '/', headers: { host: ' Example.com:8080 ', ':authority': 'example.COM:8080' } });
+            expect(res.statusCode).to.equal(200);
+            expect(res.result).to.equal('Example.com:8080|Example.com');
+        });
+
+        it('accepts host and :authority differing only by the scheme default port', async () => {
+
+            const secure = Hapi.server({ listener: Http.createServer(), tls: true });
+            secure.route({ method: 'GET', path: '/', handler: (request) => request.info.hostname });
+
+            const res1 = await secure.inject({ url: '/', headers: { host: 'example.com', ':authority': 'example.com:443' } });
+            expect(res1.statusCode).to.equal(200);
+
+            const server = Hapi.server();
+            server.route({ method: 'GET', path: '/', handler: (request) => request.info.hostname });
+
+            const res2 = await server.inject({ url: '/', headers: { host: 'example.com:80', ':authority': 'example.com' } });
+            expect(res2.statusCode).to.equal(200);
+
+            // 443 is not the default port over http, so the two still identify a different entity
+
+            const res3 = await server.inject({ url: '/', headers: { host: 'example.com', ':authority': 'example.com:443' } });
+            expect(res3.statusCode).to.equal(400);
+
+            // Unless http2 says the request came over https, e.g. behind a TLS-terminating proxy
+
+            const res4 = await server.inject({ url: '/', headers: { host: 'example.com', ':authority': 'example.com:443', ':scheme': 'https' } });
+            expect(res4.statusCode).to.equal(200);
+        });
+
+        it('rejects a request with conflicting host and :authority headers', async () => {
+
+            const server = Hapi.server();
+            server.route({ method: 'GET', path: '/', handler: (request) => `${request.info.host}|${request.info.hostname}` });
+
+            const res = await server.inject({ url: '/', headers: { host: 'attacker-controlled.example', ':authority': 'internal-trusted-service.example' } });
+            expect(res.statusCode).to.equal(400);
+            expect(res.result.message).to.equal('Host header does not match :authority pseudo-header');
+        });
+
+        it('rejects a host header that would move the boundary between authority and path', async () => {
+
+            const server = Hapi.server();
+            server.ext('onRequest', (request, h) => {
+
+                if (request.url.pathname.startsWith('/admin')) {
+                    return h.response('denied').code(401).takeover();
+                }
+
+                return h.continue;
+            });
+
+            server.route({ method: 'GET', path: '/admin/secret', handler: () => 'SECRET' });
+
+            await server.start();
+
+            const send = async (host) => {
+
+                const socket = Net.createConnection(server.info.port, '127.0.0.1', () => {
+
+                    socket.write(`GET /admin/secret HTTP/1.1\r\nHost: ${host}\r\nConnection: close\r\n\r\n`);
+                });
+
+                let response = '';
+                socket.on('data', (chunk) => {
+
+                    response += chunk.toString();
+                });
+
+                await Events.once(socket, 'close');
+                return response;
+            };
+
+            for (const host of ['evil.com/abc?x=', 'evil.com?/abc', 'evil.com#/abc', 'evil.com:fake@127.0.0.1', 'evil.com\\abc']) {
+                const response = await send(host);
+                expect(response, host).to.startWith('HTTP/1.1 400 ');
+                expect(response, host).to.not.contain('SECRET');
+            }
+
+            expect(await send('127.0.0.1')).to.startWith('HTTP/1.1 401 ');
+
+            await server.stop();
+        });
+
+        it('accepts valid host headers', async () => {
+
+            const server = Hapi.server();
+            server.route({ method: 'GET', path: '/', handler: (request) => `${request.info.hostname}|${request.url.pathname}` });
+
+            for (const host of ['example.com', 'example.com:8080', 'EXAMPLE.com', 'localhost', '[::1]:8080', '[2001:db8::1]', 'xn--bcher-kva.example', 'my_host.example', 'a.b.c.example', '127.0.0.1:80', '']) {
+                const res = await server.inject({ url: '/', headers: { host } });
+                expect(res.statusCode, host).to.equal(200);
+                expect(res.result, host).to.endWith('|/');
+            }
+        });
+
+        it('rejects a request with conflicting host and :authority headers on a vhost route', async () => {
+
+            const server = Hapi.server();
+            server.route({ method: 'GET', path: '/', vhost: 'attacker-controlled.example', handler: () => 'vhost' });
+
+            const res = await server.inject({ url: '/', headers: { host: 'attacker-controlled.example', ':authority': 'internal-trusted-service.example' } });
+            expect(res.statusCode).to.equal(400);
+        });
+
+        it('rejects a request over http2 with conflicting host and :authority headers', { skip: !Common.http2ClientSendsHost }, async () => {
+
+            const server = Hapi.server({ listener: Http2.createServer(), autoListen: true });
+            server.route({ method: 'GET', path: '/', handler: (request) => request.info.hostname });
+
+            await server.start();
+
+            const client = Http2.connect(`http://localhost:${server.info.port}`);
+            const req = client.request({ ':path': '/', ':authority': 'internal-trusted-service.example', host: 'attacker-controlled.example' });
+
+            const [headers] = await Events.once(req, 'response');
+            req.resume();
+
+            expect(headers[':status']).to.equal(400);
+
+            client.close();
+            await server.stop();
+        });
+
+        it('never serves an absolute-form :path over http2', { skip: !Common.http2ClientSendsHost }, async () => {
+
+            // nghttp2 enforces an origin-form :path on both ends, so this never reaches us whatever host
+            // and :authority say, but if it ever did the url authority would win over the two we reconcile
+
+            const server = Hapi.server({ listener: Http2.createServer(), autoListen: true });
+
+            let handled = false;
+            server.route({
+                method: 'GET',
+                path: '/',
+                handler: () => {
+
+                    handled = true;
+                    return 'served';
+                }
+            });
+
+            await server.start();
+
+            const client = Http2.connect(`http://localhost:${server.info.port}`);
+
+            const attempt = async (host) => {
+
+                const req = client.request({ ':path': 'http://internal.example/', ':authority': 'trusted.example', host });
+
+                let status = null;
+                req.on('response', (headers) => {
+
+                    status = headers[':status'];
+                });
+
+                req.resume();
+                const err = await Events.once(req, 'close').then(() => null, (close) => close);
+
+                expect(err).to.be.an.error('Stream closed with error code NGHTTP2_PROTOCOL_ERROR');
+                expect(status).to.be.null();
+            };
+
+            await attempt('trusted.example');                   // Matches :authority, so it would sail past the check
+            await attempt('attacker-controlled.example');       // Doesn't match, so it would be a bad request
+
+            client.close();
+            await server.stop();
+
+            expect(handled).to.be.false();
+        });
+
+        it('never sees an :authority header over http/1.1', async () => {
+
+            // This is a non-regression test: node.js >= 20 parser rejects ':authority' as an invalid header name,
+            // older versions parse it as an empty header name, either way it never reaches us as ':authority',
+            // but should this ever change, this test will catch it.
+
+            const server = Hapi.server();
+            server.route({ method: 'GET', path: '/', handler: (request) => `${request.info.hostname}|${request.headers[':authority']}` });
+
+            await server.start();
+
+            const attempt = async (target, hostname) => {
+
+                const socket = Net.createConnection(server.info.port, '127.0.0.1', () => {
+
+                    socket.write(`GET ${target} HTTP/1.1\r\nHost: attacker-controlled.example\r\n:authority: internal-trusted-service.example\r\nConnection: close\r\n\r\n`);
+                });
+
+                let response = '';
+                socket.on('data', (chunk) => {
+
+                    response += chunk.toString();
+                });
+
+                await Events.once(socket, 'close');
+
+                if (Common.http1RejectsPseudoHeaders) {
+                    expect(response).to.equal('HTTP/1.1 400 Bad Request\r\n\r\n');
+                }
+                else {
+                    expect(response).to.startWith('HTTP/1.1 200 OK\r\n');
+                    expect(response).to.endWith(`\r\n\r\n${hostname}|undefined`);
+                }
+            };
+
+            await attempt('/', 'attacker-controlled.example');                          // Origin-form, so host is the one routing
+            await attempt('http://internal.example/', 'internal.example');              // Absolute-form, so the url authority wins
+
+            await server.stop();
+        });
+    });
+
     describe('active()', () => {
 
         it('exits handler early when request is no longer active', { retry: true }, async (flags) => {
@@ -299,7 +693,7 @@ describe('Request', () => {
                 options: {
                     handler: async (request, h) => {
 
-                        req.abort();
+                        req.destroy();
 
                         while (request.active() && !testComplete) {
                             await Hoek.wait(10);
@@ -479,8 +873,8 @@ describe('Request', () => {
 
                 const client = Net.connect(server.info.port, () => {
 
-                    client.write('GET / HTTP/1.1\r\n\r\n');
-                    client.write('GET / HTTP/1.1\r\n\r\n');
+                    client.write('GET / HTTP/1.1\r\nHost: host\r\n\r\n');
+                    client.write('GET / HTTP/1.1\r\nHost: host\r\n\r\n');
                 });
 
                 client.on('data', () => {
@@ -556,9 +950,9 @@ describe('Request', () => {
 
             const client = Net.connect(server.info.port, () => {
 
-                client.write('GET /test HTTP/1.1\r\n\r\n');
-                client.write('GET /test HTTP/1.1\r\n\r\n');
-                client.write('GET /test HTTP/1.1\r\n\r\n');
+                client.write('GET /test HTTP/1.1\r\nHost: host\r\n\r\n');
+                client.write('GET /test HTTP/1.1\r\nHost: host\r\n\r\n');
+                client.write('GET /test HTTP/1.1\r\nHost: host\r\n\r\n');
             });
 
             await team.work;
@@ -597,7 +991,7 @@ describe('Request', () => {
 
             const handler = async (request) => {
 
-                clientRequest.abort();
+                clientRequest.destroy();
                 await Hoek.wait(10);
                 team.attend();
                 throw new Error('fail');
@@ -629,7 +1023,7 @@ describe('Request', () => {
 
             const preHandler = async (request, h) => {
 
-                clientRequest.abort();
+                clientRequest.destroy();
                 await Hoek.wait(10);
                 team.attend();
                 return h.continue;
@@ -656,7 +1050,7 @@ describe('Request', () => {
 
             const handler = async (request) => {
 
-                clientRequest.abort();
+                clientRequest.destroy();
                 await Hoek.wait(10);
                 throw new Error('boom');
             };
@@ -867,6 +1261,42 @@ describe('Request', () => {
             const res = await server.inject('/');
             expect(res.statusCode).to.equal(500);
         });
+
+        it('logs thrown errors as boom errors', async () => {
+
+            const server = Hapi.server({ debug: false });
+            server.route({
+                method: 'GET',
+                path: '/',
+                options: {
+                    handler: function () {
+
+                        // eslint-disable-next-line no-undef
+                        NOT_DEFINED_VAR;
+                    }
+                }
+            });
+
+            const log = new Promise((resolve) => {
+
+                server.events.on({ name: 'request', channels: 'internal' }, (request, event, tags) => {
+
+                    if (tags.handler &&
+                        tags.error) {
+
+                        resolve({ event, tags });
+                    }
+                });
+            });
+
+            const res = await server.inject('/');
+            expect(res.statusCode).to.equal(500);
+
+            const { event } = await log;
+            expect(event.error.isBoom).to.equal(true);
+            expect(event.error.output.statusCode).to.equal(500);
+            expect(event.error.stack).to.exist();
+        });
     });
 
     describe('_postCycle()', () => {
@@ -898,7 +1328,7 @@ describe('Request', () => {
                         status: {
                             200: async (_, { context }) => {
 
-                                req.abort();
+                                req.destroy();
 
                                 const raw = context.app.request;
                                 await Events.once(raw.req, 'aborted');
@@ -1392,6 +1822,7 @@ describe('Request', () => {
         it('handles hostname in HTTP request resource', async () => {
 
             const server = Hapi.server({ debug: false });
+            const team = new Teamwork.Team();
 
             let hostname;
             server.route({
@@ -1400,13 +1831,14 @@ describe('Request', () => {
                 handler: (request) => {
 
                     hostname = request.info.hostname;
+                    team.attend();
                     return null;
                 }
             });
 
             await server.start();
             const socket = Net.createConnection(server.info.port, '127.0.0.1', () => socket.write('GET http://host.com\r\n\r\n'));
-            await Hoek.wait(10);
+            await team.work;
             socket.destroy();
             await server.stop();
             expect(hostname).to.equal('host.com');
@@ -1590,6 +2022,23 @@ describe('Request', () => {
             const res = await server.inject('/test?a=1');
             expect(res.statusCode).to.equal(200);
             expect(res.result).to.equal('/test');
+        });
+
+        it('generates valid URL when server host is IPv6 and host header is absent', async () => {
+
+            const server = Hapi.server({ host: '::1' });
+
+            const handler = (request) => {
+
+                delete request.info.host;
+                expect(request._url).to.not.exist();
+                return request.url.host;
+            };
+
+            server.route({ path: '/test', method: 'GET', handler });
+            const res = await server.inject('/test');
+            expect(res.statusCode).to.equal(200);
+            expect(res.result).to.match(/^\[::1\]:\d+$/);
         });
     });
 
@@ -2126,7 +2575,7 @@ describe('Request', () => {
             req.flushHeaders();
 
             await ready;
-            req.abort();
+            req.destroy();
             const [request] = await log;
 
             expect(request.response.output.statusCode).to.equal(499);
@@ -2168,38 +2617,58 @@ describe('Request', () => {
             await server.stop({ timeout: 1 });
         });
 
-        it('returns a logged bad request error when parser fails after request is setup', async () => {
+        it('returns normal response when parser fails with bad method after request is setup', async () => {
 
             const server = Hapi.server({ routes: { timeout: { server: false } } });
-            server.route({ path: '/', method: 'GET', handler: Hoek.block });
+            server.route({ path: '/', method: 'GET', handler: () => 'PAYLOAD' });
             await server.start();
 
             const log = server.events.once('response');
             const client = Net.connect(server.info.port);
-            const clientEnded = new Promise((resolve, reject) => {
-
-                let response = '';
-                client.on('data', (chunk) => {
-
-                    response = response + chunk.toString();
-                });
-
-                client.on('end', () => resolve(response));
-                client.on('error', reject);
-            });
+            const clientEnded = Wreck.read(client);
 
             await new Promise((resolve) => client.on('connect', resolve));
-            client.write('GET / HTTP/1.1\nHost: test\nContent-Length: 0\n\n\ninvalid data');
+            client.write('GET / HTTP/1.1\r\nHost: test\r\nContent-Length: 0\r\n\r\ninvalid data');
 
             const [request] = await log;
-            expect(request.response.statusCode).to.equal(400);
-            const clientResponse = await clientEnded;
-            expect(clientResponse).to.contain('400 Bad Request');
+            expect(request.response.statusCode).to.equal(200);
+            expect(request.response.source).to.equal('PAYLOAD');
+            const clientResponse = (await clientEnded).toString();
+            expect(clientResponse).to.contain('HTTP/1.1 200 OK');
+
+            const nextResponse = clientResponse.slice(clientResponse.indexOf('PAYLOAD') + 7);
+            expect(nextResponse).to.startWith('HTTP/1.1 400 Bad Request');
 
             await server.stop({ timeout: 1 });
         });
 
-        it('returns a logged bad request error when parser fails after request is setup (cleanStop false)', async () => {
+        it('returns nothing when parser fails with bad method after request is setup and the connection is closed', async () => {
+
+            const server = Hapi.server({ routes: { timeout: { server: false } } });
+            server.route({ path: '/', method: 'GET', handler: (request, h) => {
+
+                request.raw.res.destroy();
+                return h.abandon;
+            } });
+
+            await server.start();
+
+            const log = server.events.once('response');
+            const client = Net.connect(server.info.port);
+            const clientEnded = Wreck.read(client);
+
+            await new Promise((resolve) => client.on('connect', resolve));
+            client.write('GET / HTTP/1.1\r\nHost: test\r\nContent-Length: 0\r\n\r\n\r\ninvalid data');
+
+            const [request] = await log;
+            expect(request.response.statusCode).to.be.undefined();
+            const clientResponse = (await clientEnded).toString();
+            expect(clientResponse).to.equal('');
+
+            await server.stop({ timeout: 1 });
+        });
+
+        it('returns a bad request when parser fails after request is setup (cleanStop false)', async () => {
 
             const server = Hapi.server({ routes: { timeout: { server: false } }, operations: { cleanStop: false } });
             server.route({ path: '/', method: 'GET', handler: Hoek.block });
@@ -2219,9 +2688,79 @@ describe('Request', () => {
             });
 
             await new Promise((resolve) => client.on('connect', resolve));
-            client.write('GET / HTTP/1.1\nHost: test\nContent-Length: 0\n\n\ninvalid data');
+            client.write('GET / HTTP/1.1\r\nHost: test\nContent-Length: 0\r\n\r\ninvalid data');
 
             const clientResponse = await clientEnded;
+            expect(clientResponse).to.contain('400 Bad Request');
+
+            await server.stop({ timeout: 1 });
+        });
+
+        it('returns a bad request for POST request when chunked parsing fails', async () => {
+
+            const server = Hapi.server({ routes: { timeout: { server: false } } });
+            server.route({ path: '/', method: 'POST', handler: () => 'ok', options: { payload: { parse: true } } });
+            await server.start();
+
+            const log = server.events.once('response');
+            const client = Net.connect(server.info.port);
+            const clientEnded = Wreck.read(client);
+
+            await new Promise((resolve) => client.on('connect', resolve));
+            client.write('POST / HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\n\r\n');
+            await Hoek.wait(10);
+            client.write('not chunked\r\n');
+
+            const [request] = await log;
+            expect(request.response.statusCode).to.equal(400);
+            expect(request.response.source).to.contain({ error: 'Bad Request' });
+            const clientResponse = (await clientEnded).toString();
+            expect(clientResponse).to.contain('400 Bad Request');
+
+            await server.stop({ timeout: 1 });
+        });
+
+        it('returns a bad request for POST request when chunked parsing fails (cleanStop false)', async () => {
+
+            const server = Hapi.server({ routes: { timeout: { server: false } }, operations: { cleanStop: false } });
+            server.route({ path: '/', method: 'POST', handler: () => 'ok', options: { payload: { parse: true } } });
+            await server.start();
+
+            const client = Net.connect(server.info.port);
+            const clientEnded = Wreck.read(client);
+
+            await new Promise((resolve) => client.on('connect', resolve));
+            client.write('POST / HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\n\r\n');
+            await Hoek.wait(10);
+            client.write('not chunked\r\n');
+
+            const clientResponse = (await clientEnded).toString();
+            expect(clientResponse).to.contain('400 Bad Request');
+
+            await server.stop({ timeout: 1 });
+        });
+
+        it('returns a bad request for POST request when chunked parsing fails', async () => {
+
+            const server = Hapi.server({ routes: { timeout: { server: false } } });
+            server.route({ path: '/', method: 'POST', handler: () => 'ok', options: { payload: { parse: true } } });
+            await server.start();
+
+            const log = server.events.once('response');
+            const client = Net.connect(server.info.port);
+            const clientEnded = Wreck.read(client);
+
+            await new Promise((resolve) => client.on('connect', resolve));
+            client.write('POST / HTTP/1.1\r\nHost: test\r\nContent-Length: 5\r\n\r\n');
+            await Hoek.wait(10);
+            client.write('111A1');        // Doesn't work if 'A' is replaced with '1' !?!
+            client.write('\Q\r\n');       // Extra bytes considered to be start of next request
+            client.end();
+
+            const [request] = await log;
+            expect(request.response.statusCode).to.equal(400);
+            expect(request.response.source).to.contain({ error: 'Bad Request' });
+            const clientResponse = (await clientEnded).toString();
             expect(clientResponse).to.contain('400 Bad Request');
 
             await server.stop({ timeout: 1 });

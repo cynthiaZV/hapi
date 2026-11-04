@@ -73,7 +73,7 @@ describe('handler', () => {
             expect(res.statusCode).to.equal(500);
 
             const [, event] = await log;
-            expect(event.error.message).to.equal('Cannot read property \'here\' of null');
+            expect(event.error.message).to.include(['Cannot read prop', 'null', 'here']);
         });
     });
 
@@ -578,6 +578,7 @@ describe('handler', () => {
             expect(event.error.isBoom).to.equal(true);
             expect(event.error.output.statusCode).to.equal(403);
             expect(event.error.message).to.equal('Forbidden');
+            expect(event.error.stack).to.exist();
         });
     });
 

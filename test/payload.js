@@ -1,16 +1,18 @@
 'use strict';
 
+const Events = require('events');
 const Fs = require('fs');
 const Http = require('http');
+const Net = require('net');
 const Path = require('path');
 const Zlib = require('zlib');
 
+const Boom = require('@hapi/boom');
 const Code = require('@hapi/code');
 const Hapi = require('..');
 const Hoek = require('@hapi/hoek');
 const Lab = require('@hapi/lab');
 const Wreck = require('@hapi/wreck');
-
 
 const internals = {};
 
@@ -77,6 +79,54 @@ describe('Payload', () => {
         expect(request.response.output.statusCode).to.equal(500);
     });
 
+    it('handles aborted request mid-lifecycle step', async (flags) => {
+
+        let req = null;
+        const server = Hapi.server();
+
+        server.route({
+            method: 'GET',
+            path: '/',
+            handler: async (request) => {
+
+                req.destroy();
+
+                await request.events.once('disconnect');
+
+                return 'ok';
+            }
+        });
+
+        // Register post handler that should not be called
+
+        let post = 0;
+        server.ext('onPostHandler', () => {
+
+            ++post;
+        });
+
+        flags.onCleanup = () => server.stop();
+        await server.start();
+
+        req = Http.request({
+            hostname: 'localhost',
+            port: server.info.port,
+            method: 'get'
+        });
+
+        req.on('error', Hoek.ignore);
+        req.end();
+
+        const [request] = await server.events.once('response');
+
+        expect(request.response.isBoom).to.be.true();
+        expect(request.response.output.statusCode).to.equal(499);
+        expect(request.info.completed).to.be.above(0);
+        expect(request.info.responded).to.equal(0);
+
+        expect(post).to.equal(0);
+    });
+
     it('handles aborted request', { retry: true }, async () => {
 
         const server = Hapi.server();
@@ -99,7 +149,7 @@ describe('Payload', () => {
         const req = Http.request(options, (res) => { });
         req.on('error', Hoek.ignore);
         req.write('Hello\n');
-        setTimeout(() => req.abort(), 50);
+        setTimeout(() => req.destroy(), 50);
 
         const [event] = await log;
         expect(event.error.message).to.equal('Parse Error');
@@ -232,10 +282,147 @@ describe('Payload', () => {
 
         await server.start();
 
-        const uri = 'http://localhost:' + server.info.port;
-        const { res, payload } = await Wreck.post(uri, { payload: { hello: true }, headers: { expect: '100-continue' } });
-        expect(res.statusCode).to.equal(200);
-        expect(payload.toString()).to.equal('{"hello":true}');
+        const client = Net.connect(server.info.port);
+
+        await Events.once(client, 'connect');
+
+        client.write('POST / HTTP/1.1\r\nexpect: 100-continue\r\nhost: host\r\naccept-encoding: gzip\r\n' +
+                     'content-type: application/json\r\ncontent-length: 14\r\nConnection: close\r\n\r\n');
+
+        const lines = [];
+        client.setEncoding('ascii');
+        for await (const chunk of client) {
+
+            if (chunk.startsWith('HTTP/1.1 100 Continue')) {
+                client.write('{"hello":true}');
+            }
+            else {
+                lines.push(...chunk.split('\r\n'));
+            }
+        }
+
+        const res = lines.shift();
+        const payload = lines.pop();
+
+        expect(res).to.equal('HTTP/1.1 200 OK');
+        expect(payload).to.equal('{"hello":true}');
+
+        await server.stop();
+    });
+
+    it('does not continue on errors before payload processing', async () => {
+
+        const server = Hapi.server();
+        server.route({ method: 'POST', path: '/', handler: (request) => request.payload });
+        server.ext('onPreAuth', (request, h) => {
+
+            throw new Boom.forbidden();
+        });
+
+        await server.start();
+
+        const client = Net.connect(server.info.port);
+
+        await Events.once(client, 'connect');
+
+        client.write('POST / HTTP/1.1\r\nexpect: 100-continue\r\nhost: host\r\naccept-encoding: gzip\r\n' +
+            'content-type: application/json\r\ncontent-length: 14\r\nConnection: close\r\n\r\n');
+
+        let continued = false;
+        const lines = [];
+        client.setEncoding('ascii');
+        for await (const chunk of client) {
+
+            if (chunk.startsWith('HTTP/1.1 100 Continue')) {
+                client.write('{"hello":true}');
+                continued = true;
+            }
+            else {
+                lines.push(...chunk.split('\r\n'));
+            }
+        }
+
+        const res = lines.shift();
+
+        expect(res).to.equal('HTTP/1.1 403 Forbidden');
+        expect(continued).to.be.false();
+
+        await server.stop();
+    });
+
+    it('handles expect 100-continue on undefined routes', async () => {
+
+        const server = Hapi.server();
+        await server.start();
+
+        const client = Net.connect(server.info.port);
+
+        await Events.once(client, 'connect');
+
+        client.write('POST / HTTP/1.1\r\nexpect: 100-continue\r\nhost: host\r\naccept-encoding: gzip\r\n' +
+            'content-type: application/json\r\ncontent-length: 14\r\nConnection: close\r\n\r\n');
+
+        let continued = false;
+        const lines = [];
+        client.setEncoding('ascii');
+        for await (const chunk of client) {
+
+            if (chunk.startsWith('HTTP/1.1 100 Continue')) {
+                client.write('{"hello":true}');
+                continued = true;
+            }
+            else {
+                lines.push(...chunk.split('\r\n'));
+            }
+        }
+
+        const res = lines.shift();
+
+        expect(res).to.equal('HTTP/1.1 404 Not Found');
+        expect(continued).to.be.false();
+
+        await server.stop();
+    });
+
+    it('does not continue on custom request.payload', async () => {
+
+        const server = Hapi.server();
+        server.route({ method: 'POST', path: '/', handler: (request) => request.payload });
+        server.ext('onRequest', (request, h) => {
+
+            request.payload = { custom: true };
+            return h.continue;
+        });
+
+        await server.start();
+
+        const client = Net.connect(server.info.port);
+
+        await Events.once(client, 'connect');
+
+        client.write('POST / HTTP/1.1\r\nexpect: 100-continue\r\nhost: host\r\naccept-encoding: gzip\r\n' +
+            'content-type: application/json\r\ncontent-length: 14\r\nConnection: close\r\n\r\n');
+
+        let continued = false;
+        const lines = [];
+        client.setEncoding('ascii');
+        for await (const chunk of client) {
+
+            if (chunk.startsWith('HTTP/1.1 100 Continue')) {
+                client.write('{"hello":true}');
+                continued = true;
+            }
+            else {
+                lines.push(...chunk.split('\r\n'));
+            }
+        }
+
+        const res = lines.shift();
+        const payload = lines.pop();
+
+        expect(res).to.equal('HTTP/1.1 200 OK');
+        expect(payload).to.equal('{"custom":true}');
+        expect(continued).to.be.false();
 
         await server.stop();
     });
@@ -637,6 +824,19 @@ describe('Payload', () => {
         expect(res.result.field1.length).to.equal(2);
         expect(res.result.field1[1]).to.equal('Repeated name segment');
         expect(res.result.pics).to.exist();
+    });
+
+    it('places default limit on max parts in multipart payloads', async () => {
+
+        const part = '--AaB03x\r\n' + 'content-disposition: form-data; name="x"\r\n\r\n' + 'x\r\n';
+        const multipartPayload = part.repeat(1001) + '--AaB03x--\r\n';
+
+        const server = Hapi.server({ routes: { payload: { multipart: true } } });
+        server.route({ method: 'POST', path: '/', handler: () => null });
+
+        const res = await server.inject({ method: 'POST', url: '/', payload: multipartPayload, headers: { 'content-type': 'multipart/form-data; boundary=AaB03x' } });
+        expect(res.statusCode).to.equal(400);
+        expect(res.result.message).to.equal('Invalid multipart payload format');
     });
 
     it('signals connection close when payload is unconsumed', async () => {

@@ -16,7 +16,6 @@ const Hoek = require('@hapi/hoek');
 const Bounce = require('@hapi/bounce');
 const Inert = require('@hapi/inert');
 const Lab = require('@hapi/lab');
-const LegacyReadableStream = require('legacy-readable-stream');
 const Teamwork = require('@hapi/teamwork');
 const Wreck = require('@hapi/wreck');
 
@@ -55,6 +54,77 @@ describe('transmission', () => {
             server.route({ method: 'GET', path: '/', handler: (request, h) => h.redirect('/bad/path/\n') });
             const res = await server.inject('/');
             expect(res.statusCode).to.equal(500);
+        });
+
+        it('handles invalid cookie value on unsatisfiable range', async () => {
+
+            const server = Hapi.server();
+            server.route({ method: 'GET', path: '/', handler: (request, h) => h.response('ok').state('session', 'က') });
+
+            const res1 = await server.inject('/');
+            expect(res1.statusCode).to.equal(500);
+
+            const log = server.events.once('response');
+            const res2 = await server.inject({ url: '/', headers: { range: 'bytes=abc' } });
+            expect(res2.aborted).to.be.true();
+            expect(res2.statusCode).to.equal(499);
+            expect(res2.headers).to.not.exist();
+
+            const [request] = await log;
+            expect(request.response.output.statusCode).to.equal(500);
+            expect(request.raw.res.destroyed).to.be.true();
+        });
+
+        it('handles error response transmission failure', async () => {
+
+            const server = Hapi.server();
+            server.route({
+                method: 'GET', path: '/', handler: (request) => {
+
+                    request.raw.res.writeHead = () => {
+
+                        throw new Error('Persistent failure');
+                    };
+
+                    return 'ok';
+                }
+            });
+
+            const errors = [];
+            server.events.on({ name: 'request', channels: 'internal' }, (request, event, tags) => {
+
+                if (tags.error) {
+                    errors.push(event);
+                }
+            });
+
+            const log = server.events.once('response');
+            const res = await server.inject('/');
+            expect(res.aborted).to.be.true();
+            expect(res.statusCode).to.equal(499);
+
+            expect(errors).to.have.length(1);
+            expect(errors[0].tags).to.equal(['response', 'error']);
+            expect(errors[0].error.message).to.equal('Persistent failure');
+
+            const [request] = await log;
+            expect(request.response.output.statusCode).to.equal(500);
+            expect(request.response.message).to.equal('Persistent failure');
+            expect(request.raw.res.destroyed).to.be.true();
+        });
+
+        it('handles invalid status message', async () => {
+
+            const server = Hapi.server();
+            server.route({ method: 'GET', path: '/', handler: (request, h) => h.response('ok').message(request.query.reason || 'OK') });
+
+            const res1 = await server.inject('/');
+            expect(res1.statusCode).to.equal(200);
+
+            const res2 = await server.inject('/?reason=OK%0d%0aX-Injected:%201');
+            expect(res2.statusCode).to.equal(500);
+            expect(res2.statusMessage).to.equal('Internal Server Error');
+            expect(res2.headers['x-injected']).to.not.exist();
         });
     });
 
@@ -360,138 +430,6 @@ describe('transmission', () => {
             expect(res.statusCode).to.equal(201);
         });
 
-        it('returns an JSONP response', async () => {
-
-            const server = Hapi.server();
-            server.route({ method: 'GET', path: '/', options: { jsonp: 'callback', handler: () => ({ some: 'value' }) } });
-
-            const res = await server.inject('/?callback=me');
-            expect(res.payload).to.equal('/**/me({"some":"value"});');
-            expect(res.headers['content-length']).to.equal(25);
-            expect(res.headers['content-type']).to.equal('text/javascript; charset=utf-8');
-        });
-
-        it('returns an JSONP response with no payload', async () => {
-
-            const server = Hapi.server();
-            server.route({ method: 'GET', path: '/', options: { jsonp: 'callback', handler: () => null } });
-
-            const res = await server.inject('/?callback=me');
-            expect(res.payload).to.equal('/**/me();');
-            expect(res.headers['content-length']).to.equal(9);
-            expect(res.headers['content-type']).to.equal('text/javascript; charset=utf-8');
-        });
-
-        it('returns an JSONP response (no charset)', async () => {
-
-            const server = Hapi.server();
-            server.route({ method: 'GET', path: '/', options: { jsonp: 'callback', handler: (request, h) => h.response({ some: 'value' }).charset('') } });
-
-            const res = await server.inject('/?callback=me');
-            expect(res.payload).to.equal('/**/me({"some":"value"});');
-            expect(res.headers['content-length']).to.equal(25);
-            expect(res.headers['content-type']).to.equal('text/javascript');
-        });
-
-        it('returns a X-Content-Type-Options: nosniff header on JSONP responses', async () => {
-
-            const server = Hapi.server();
-            server.route({ method: 'GET', path: '/', options: { jsonp: 'callback', handler: () => ({ some: 'value' }) } });
-
-            const res = await server.inject('/?callback=me');
-            expect(res.payload).to.equal('/**/me({"some":"value"});');
-            expect(res.headers['x-content-type-options']).to.equal('nosniff');
-        });
-
-        it('returns a normal response when JSONP enabled but not requested', async () => {
-
-            const server = Hapi.server();
-            server.route({ method: 'GET', path: '/', options: { jsonp: 'callback', handler: () => ({ some: 'value' }) } });
-
-            const res = await server.inject('/');
-            expect(res.payload).to.equal('{"some":"value"}');
-        });
-
-        it('returns an JSONP response with compression', async () => {
-
-            const server = Hapi.server({ compression: { minBytes: 1 } });
-            server.route({
-                method: 'GET',
-                path: '/user/{name*2}',
-                options: {
-                    handler: (request) => {
-
-                        const parts = request.params.name.split('/');
-                        return { first: parts[0], last: parts[1] };
-                    },
-                    jsonp: 'callback'
-                }
-            });
-
-            const res = await server.inject({ url: '/user/1/2?callback=docall', headers: { 'accept-encoding': 'gzip' } });
-            expect(res.headers['content-type']).to.equal('text/javascript; charset=utf-8');
-            expect(res.headers['content-encoding']).to.equal('gzip');
-            expect(res.headers.vary).to.equal('accept-encoding');
-
-            const uncompressed = await internals.uncompress('unzip', res.rawPayload);
-            expect(uncompressed.toString()).to.equal('/**/docall({"first":"1","last":"2"});');
-        });
-
-        it('returns an JSONP response when response is a buffer', async () => {
-
-            const server = Hapi.server();
-            server.route({ method: 'GET', path: '/', options: { jsonp: 'callback', handler: () => Buffer.from('value') } });
-
-            const res = await server.inject('/?callback=me');
-            expect(res.payload).to.equal('/**/me(value);');
-            expect(res.headers['content-length']).to.equal(14);
-        });
-
-        it('returns response on bad JSONP parameter', async () => {
-
-            const server = Hapi.server();
-            server.route({ method: 'GET', path: '/', options: { jsonp: 'callback', handler: () => ({ some: 'value' }) } });
-
-            const res = await server.inject('/?callback=me*');
-            expect(res.result).to.exist();
-            expect(res.result.message).to.equal('Invalid JSONP parameter value');
-        });
-
-        it('returns an JSONP handler error', async () => {
-
-            const handler = () => {
-
-                throw Boom.badRequest('wrong');
-            };
-
-            const server = Hapi.server();
-            server.route({ method: 'GET', path: '/', options: { jsonp: 'callback', handler } });
-
-            const res = await server.inject('/?callback=me');
-            expect(res.payload).to.equal('/**/me({"statusCode":400,"error":"Bad Request","message":"wrong"});');
-            expect(res.headers['content-type']).to.equal('text/javascript; charset=utf-8');
-        });
-
-        it('returns an JSONP state error', async () => {
-
-            const server = Hapi.server();
-            server.route({ method: 'GET', path: '/', options: { jsonp: 'callback', handler: () => 'ok' } });
-
-            let validState = false;
-            const preResponse = (request, h) => {
-
-                validState = request.state && typeof request.state === 'object';
-                return h.continue;
-            };
-
-            server.ext('onPreResponse', preResponse);
-
-            const res = await server.inject({ method: 'GET', url: '/?callback=me', headers: { cookie: '+' } });
-            expect(res.payload).to.equal('/**/me({"statusCode":400,"error":"Bad Request","message":"Invalid cookie header"});');
-            expect(res.headers['content-type']).to.equal('text/javascript; charset=utf-8');
-            expect(validState).to.equal(true);
-        });
-
         it('sets specific caching headers', async () => {
 
             const server = Hapi.server();
@@ -561,7 +499,7 @@ describe('transmission', () => {
             const log = server.events.once('response');
             const client = Net.connect(server.info.port, () => {
 
-                client.write('GET / HTTP/1.1\r\n\r\n');
+                client.write('GET / HTTP/1.1\r\nHost: host\r\naccept-encoding: gzip\r\n\r\n');
             });
 
             const [request] = await log;
@@ -712,7 +650,7 @@ describe('transmission', () => {
 
                     this.isDone = true;
                     this.push('success');
-                    setImmediate(() => this.emit('error', new Error()));
+                    setImmediate(() => this.emit('error', new Error('stream error')));
                 };
 
                 return stream;
@@ -722,16 +660,17 @@ describe('transmission', () => {
             server.route({ method: 'GET', path: '/', handler });
             const log = server.events.once('response');
 
-            const res = await server.inject('/');
-            expect(res.statusCode).to.equal(500);
-            expect(res.statusMessage).to.equal('Internal Server Error');
-            expect(res.result.message).to.equal('An internal server error occurred');
-            expect(res.raw.res.statusCode).to.equal(200);
-            expect(res.raw.res.statusMessage).to.equal('OK');
-            expect(res.rawPayload.toString()).to.equal('success');
+            const err = await expect(server.inject('/')).to.reject(Boom.Boom);
+            expect(err.output.statusCode).to.equal(499);
+            expect(err.output.payload.error).to.equal('Unknown');
+            expect(err.output.payload.message).to.equal('Response error');
+            expect(err.data.request.response.message).to.equal('stream error');
+            expect(err.data.request.raw.res.statusCode).to.equal(200);
+            expect(err.data.request.raw.res.statusMessage).to.equal('OK');
 
             const [request] = await log;
-            expect(request.response.statusCode).to.equal(500);
+            expect(request.response.message).to.equal('stream error');
+            expect(request.response.output.statusCode).to.equal(500);
             expect(request.info.completed).to.be.above(0);
             expect(request.info.responded).to.equal(0);
         });
@@ -750,7 +689,7 @@ describe('transmission', () => {
                     this.isDone = true;
 
                     this.push('something');
-                    setImmediate(() => this.emit('error', new Error()));
+                    setImmediate(() => this.emit('error', new Error('stream error')));
                 };
 
                 return stream;
@@ -766,7 +705,8 @@ describe('transmission', () => {
 
             const [request] = await log;
             expect(err.data.res.statusCode).to.equal(200);
-            expect(request.response.statusCode).to.equal(500);
+            expect(request.response.message).to.equal('stream error');
+            expect(request.response.output.statusCode).to.equal(500);
             expect(request.info.completed).to.be.above(0);
             expect(request.info.responded).to.equal(0);
         });
@@ -1232,15 +1172,15 @@ describe('transmission', () => {
                 return h.response(stream).bytes(0);
             } });
 
-            const res = await server.inject({ url: '/stream', headers: { 'Accept-Encoding': 'gzip' } });
-            expect(res.statusCode).to.equal(499);
-            expect(res.statusMessage).to.equal('Unknown');
-            expect(res.raw.res.statusCode).to.equal(204);
-            expect(res.raw.res.statusMessage).to.equal('No Content');
-            expect(res.rawPayload.toString()).to.equal('here is the response');
+            const err = await expect(server.inject({ url: '/stream', headers: { 'Accept-Encoding': 'gzip' } })).to.reject(Boom.Boom);
+            expect(err.output.statusCode).to.equal(499);
+            expect(err.output.payload.error).to.equal('Unknown');
+            expect(err.output.payload.message).to.equal('Request close');
+            expect(err.data.request.raw.res.statusCode).to.equal(204);
+            expect(err.data.request.raw.res.statusMessage).to.equal('No Content');
 
             const [request] = await log;
-            expect(request.response.statusCode).to.equal(499);
+            expect(request.response.output.statusCode).to.equal(499);
             expect(request.info.completed).to.be.above(0);
             expect(request.info.responded).to.equal(0);
 
@@ -1423,7 +1363,7 @@ describe('transmission', () => {
             const team = new Teamwork.Team();
             const handler = async (request) => {
 
-                clientRequest.abort();
+                clientRequest.destroy();
 
                 const stream = new Stream.Readable({
                     read(size) {
@@ -1460,84 +1400,6 @@ describe('transmission', () => {
 
             await team.work;
             await server.stop();
-        });
-
-        it('close() stream when no destroy() method', async () => {
-
-            const server = Hapi.server();
-
-            const team = new Teamwork.Team();
-            const handler = (request) => {
-
-                const stream = new LegacyReadableStream.Readable();
-                stream._read = function (size) {
-
-                    const chunk = new Array(size).join('x');
-
-                    setTimeout(() => {
-
-                        this.push(chunk);
-                    }, 10);
-                };
-
-                stream.close = () => team.attend();
-
-                return stream;
-            };
-
-            server.route({ method: 'GET', path: '/', handler });
-
-            await server.start();
-
-            const res = await Wreck.request('GET', 'http://localhost:' + server.info.port);
-            res.once('data', (chunk) => {
-
-                res.destroy();
-            });
-
-            await team.work;
-            await server.stop();
-
-            expect(res.statusCode).to.equal(200);
-        });
-
-        it('unpipe() stream when no destroy() or close() method', async () => {
-
-            const server = Hapi.server();
-
-            const team = new Teamwork.Team();
-            const handler = (request) => {
-
-                const stream = new LegacyReadableStream.Readable();
-                stream._read = function (size) {
-
-                    const chunk = new Array(size).join('x');
-
-                    setTimeout(() => {
-
-                        this.push(chunk);
-                    }, 10);
-                };
-
-                stream.unpipe = () => team.attend();
-
-                return stream;
-            };
-
-            server.route({ method: 'GET', path: '/', handler });
-
-            await server.start();
-
-            const res = await Wreck.request('GET', 'http://localhost:' + server.info.port);
-            res.once('data', (chunk) => {
-
-                res.destroy();
-            });
-
-            await team.work;
-            await server.stop();
-
-            expect(res.statusCode).to.equal(200);
         });
 
         it('changes etag when content-encoding set manually', async () => {
@@ -1627,6 +1489,63 @@ describe('transmission', () => {
             expect(count).to.equal(1);
         });
 
+        it('handles stream that is destroyed with no error', async () => {
+
+            const handler = (request, h) => {
+
+                const stream = new Stream.Readable({ read: Hoek.ignore });
+
+                stream.push('hello');
+                Hoek.wait(1).then(() => stream.destroy());
+
+                return h.response(stream).type('text/html');
+            };
+
+            const server = Hapi.server();
+            server.route({ method: 'GET', path: '/', handler });
+
+            const log = server.events.once('response');
+            const err = await expect(server.inject({ url: '/', headers: { 'accept-encoding': 'gzip' } })).to.reject(Boom.Boom);
+            expect(err.output.statusCode).to.equal(499);
+
+            const [request] = await log;
+            expect(request.response.isBoom).to.be.true();
+            expect(request.response.output.statusCode).to.equal(499);
+        });
+
+        it('handles stream that is destroyed with error', async () => {
+
+            const handler = (request, h) => {
+
+                const stream = new Stream.Readable({ read: Hoek.ignore });
+                if (stream.errored === undefined) {
+
+                    // Expose errored property on node 14 & 16 to enable coverage
+
+                    stream.on('error', () => {
+
+                        stream.errored = true;
+                    });
+                }
+
+                stream.push('hello');
+                Hoek.wait(1).then(() => stream.destroy(new Error('failed')));
+
+                return h.response(stream).type('text/html');
+            };
+
+            const server = Hapi.server();
+            server.route({ method: 'GET', path: '/', handler });
+
+            const log = server.events.once('response');
+            const err = await expect(server.inject({ url: '/', headers: { 'accept-encoding': 'gzip' } })).to.reject(Boom.Boom);
+            expect(err.output.statusCode).to.equal(499);
+
+            const [request] = await log;
+            expect(request.response.isBoom).to.be.true();
+            expect(request.response.output.statusCode).to.equal(500);
+        });
+
         describe('response range', () => {
 
             const fileStreamHandler = (request, h) => {
@@ -1681,6 +1600,20 @@ describe('transmission', () => {
                 expect(res.headers['content-range']).to.equal('bytes 42005-42009/42010');
                 expect(res.headers['accept-ranges']).to.equal('bytes');
                 expect(res.rawPayload.toString('binary')).to.equal('D\xAEB\x60\x82');
+            });
+
+            it('returns the full payload when suffix range exceeds length (-to)', async () => {
+
+                const server = Hapi.server();
+                server.route({ method: 'GET', path: '/', handler: () => 'abcde' });
+
+                for (const range of ['bytes=-6', 'bytes=-4294967296', 'bytes=-999999999999999999999999']) {
+                    const res = await server.inject({ url: '/', headers: { range } });
+                    expect(res.statusCode).to.equal(206);
+                    expect(res.headers['content-length']).to.equal(5);
+                    expect(res.headers['content-range']).to.equal('bytes 0-4/5');
+                    expect(res.payload).to.equal('abcde');
+                }
             });
 
             it('returns a subset of a fileStream (from-)', async () => {
@@ -2056,7 +1989,7 @@ describe('transmission', () => {
 
     describe('chain()', () => {
 
-        it('handles stream errors on the response after the response has been piped (http)', async () => {
+        it('handles stream errors on the response after the response has been piped', async () => {
 
             const handler = (request, h) => {
 
@@ -2079,8 +2012,8 @@ describe('transmission', () => {
             const server = Hapi.server({ compression: { minBytes: 1 } });
             server.route({ method: 'GET', path: '/', handler });
 
-            const res = await server.inject({ url: '/', headers: { 'accept-encoding': 'gzip' } });
-            expect(res.statusCode).to.equal(500);
+            const err = await expect(server.inject({ url: '/', headers: { 'accept-encoding': 'gzip' } })).to.reject(Boom.Boom);
+            expect(err.output.statusCode).to.equal(499);
         });
     });
 });

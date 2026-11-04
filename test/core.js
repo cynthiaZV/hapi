@@ -1,6 +1,7 @@
 'use strict';
 
 const ChildProcess = require('child_process');
+const Events = require('events');
 const Fs = require('fs');
 const Http = require('http');
 const Https = require('https');
@@ -11,17 +12,19 @@ const Stream = require('stream');
 const TLS = require('tls');
 
 const Boom = require('@hapi/boom');
-const CatboxMemory = require('@hapi/catbox-memory');
+const { Engine: CatboxMemory } = require('@hapi/catbox-memory');
 const Code = require('@hapi/code');
 const Handlebars = require('handlebars');
 const Hapi = require('..');
 const Hoek = require('@hapi/hoek');
 const Inert = require('@hapi/inert');
 const Lab = require('@hapi/lab');
+const Teamwork = require('@hapi/teamwork');
 const Vision = require('@hapi/vision');
 const Wreck = require('@hapi/wreck');
 
 const Common = require('./common');
+
 
 const internals = {};
 
@@ -32,7 +35,13 @@ const expect = Code.expect;
 
 describe('Core', () => {
 
-    it('sets connections defaults', () => {
+    it('sets app settings defaults', () => {
+
+        const server = Hapi.server();
+        expect(server.settings.app).to.equal({});
+    });
+
+    it('sets app settings', () => {
 
         const server = Hapi.server({ app: { message: 'test defaults' } });
         expect(server.settings.app.message).to.equal('test defaults');
@@ -90,38 +99,58 @@ describe('Core', () => {
         }).to.throw('Cannot specify port when autoListen is false');
     });
 
-    it('defaults address to 0.0.0.0 or :: when no host is provided', async () => {
+    it('defaults address to 0.0.0.0 or :: when no host is provided', async (flags) => {
 
         const server = Hapi.server();
         await server.start();
+        flags.onCleanup = () => server.stop();
 
-        let expectedBoundAddress = '0.0.0.0';
-        if (Net.isIPv6(server.listener.address().address)) {
-            expectedBoundAddress = '::';
-        }
+        const expectedBoundAddress = Common.hasIPv6 ? '::' : '0.0.0.0';
 
         expect(server.info.address).to.equal(expectedBoundAddress);
-        await server.stop();
     });
 
-    it('uses address when present instead of host', async () => {
+    it('is accessible on localhost when using default host', async (flags) => {
+        // With hapi v20 this would fail on ipv6 machines on node v18+ due to DNS resolution changes in node (see nodejs/node#40537).
+        // To address this in hapi v21 we bind to :: if available, otherwise the former default of 0.0.0.0.
+
+        const server = Hapi.server();
+        server.route({ method: 'get', path: '/', handler: () => 'ok' });
+
+        await server.start();
+        flags.onCleanup = () => server.stop();
+
+        const req = Http.get(`http://localhost:${server.info.port}`);
+        const [res] = await Events.once(req, 'response');
+
+        let result = '';
+        for await (const chunk of res) {
+            result += chunk.toString();
+        }
+
+        expect(result).to.equal('ok');
+    });
+
+    it('uses address when present instead of host', async (flags) => {
 
         const server = Hapi.server({ host: 'no.such.domain.hapi', address: 'localhost' });
         await server.start();
+        flags.onCleanup = () => server.stop();
+
         expect(server.info.host).to.equal('no.such.domain.hapi');
-        expect(server.info.address).to.equal('127.0.0.1');
-        await server.stop();
+        expect(server.info.address).to.match(/^127\.0\.0\.1|::1$/); // ::1 on node v18 with ipv6 support
     });
 
-    it('uses uri when present instead of host and port', async () => {
+    it('uses uri when present instead of host and port', async (flags) => {
 
         const server = Hapi.server({ host: 'no.such.domain.hapi', address: 'localhost', uri: 'http://uri.example.com:8080' });
         expect(server.info.uri).to.equal('http://uri.example.com:8080');
         await server.start();
+        flags.onCleanup = () => server.stop();
+
         expect(server.info.host).to.equal('no.such.domain.hapi');
-        expect(server.info.address).to.equal('127.0.0.1');
+        expect(server.info.address).to.match(/^127\.0\.0\.1|::1$/); // ::1 on node v18 with ipv6 support
         expect(server.info.uri).to.equal('http://uri.example.com:8080');
-        await server.stop();
     });
 
     it('throws on uri ending with /', () => {
@@ -335,7 +364,7 @@ describe('Core', () => {
             expect(res.statusCode).to.equal(500);
 
             const [, event] = await log;
-            expect(event.error.message).to.equal('Cannot read property \'here\' of null');
+            expect(event.error.message).to.include(['Cannot read prop', 'null', 'here']);
         });
     });
 
@@ -620,7 +649,7 @@ describe('Core', () => {
             expect(server._core.sockets.size).to.equal(1);
             expect(count).to.equal(1);
 
-            promise.req.abort();
+            promise.req.destroy();
             await expect(promise).to.reject();
 
             await Hoek.wait(50);
@@ -660,7 +689,7 @@ describe('Core', () => {
             expect(server._core.sockets.size).to.equal(1);
             expect(count).to.equal(1);
 
-            promise.req.abort();
+            promise.req.destroy();
             await expect(promise).to.reject();
 
             await Hoek.wait(50);
@@ -807,7 +836,7 @@ describe('Core', () => {
             await server.start();
 
             const socket = await internals.socket(server);
-            socket.write('GET / HTTP/1.0\nHost: test\n\n');
+            socket.write('GET / HTTP/1.0\r\nHost: test\r\n\r\n');
             await Hoek.wait(10);
 
             const count1 = await internals.countConnections(server);
@@ -825,7 +854,7 @@ describe('Core', () => {
             await server.start();
 
             const socket = await internals.socket(server);
-            socket.write('GET / HTTP/1.0\nHost: test\n\n');
+            socket.write('GET / HTTP/1.0\r\nHost: test\r\n\r\n');
             await Hoek.wait(10);
 
             const count1 = await internals.countConnections(server);
@@ -846,7 +875,7 @@ describe('Core', () => {
             await server.start();
 
             const socket = await internals.socket(server);
-            socket.write('GET / HTTP/1.1\nHost: test\nConnection: Keep-Alive\n\n\n');
+            socket.write('GET / HTTP/1.1\r\nHost: test\r\nConnection: Keep-Alive\r\n\r\n\r\n');
             await new Promise((resolve) => socket.on('data', resolve));
 
             const count = await internals.countConnections(server);
@@ -864,7 +893,7 @@ describe('Core', () => {
             await server.start();
 
             const socket = await internals.socket(server);
-            socket.write('GET / HTTP/1.0\nHost: test\n\n');
+            socket.write('GET / HTTP/1.0\r\nHost: test\r\n\r\n');
             await Hoek.wait(10);
 
             const count1 = await internals.countConnections(server);
@@ -900,10 +929,32 @@ describe('Core', () => {
             const { res, payload } = await first;
             const stop = server.stop();
 
-            await expect(second).to.reject();
+            const err = await expect(second).to.reject(Error);
             await stop;
+            await Hoek.wait(10);
 
             expect(res.headers.connection).to.equal('keep-alive');
+            expect(payload.toString()).to.equal('ok');
+            expect(err.code).to.equal('ECONNRESET');
+            expect(server._core.started).to.equal(false);
+        });
+
+        it('allows incoming requests during the stopping phase', async () => {
+
+            const team = new Teamwork.Team();
+
+            const server = Hapi.server();
+            server.route({ method: 'GET', path: '/', handler: () => 'ok' });
+            server.ext('onPreStop', () => team.work);
+
+            await server.start();
+            const stop = server.stop();
+            const { res, payload } = await Wreck.get(`http://localhost:${server.info.port}`);
+
+            team.attend();       // Allow server to finalize stop
+            await stop;
+
+            expect(res.headers.connection).to.equal('close');
             expect(payload.toString()).to.equal('ok');
             expect(server._core.started).to.equal(false);
         });
@@ -1070,6 +1121,37 @@ describe('Core', () => {
             expect(tags.load).to.be.true();
 
             await server.stop();
+        });
+
+        it('doesn\'t setup listeners for cleanStop when socket is missing', async () => {
+
+            const server = Hapi.server();
+
+            server.route({
+                method: 'get',
+                path: '/',
+                handler: (request) => request.raw.res.listenerCount('finish')
+            });
+
+            const { result: normalFinishCount } = await server.inject('/');
+
+            const { _dispatch } = server._core;
+
+            server._core._dispatch = (opts) => {
+
+                const fn = _dispatch.call(server._core, opts);
+
+                return (req, res) => {
+
+                    req.socket = null;
+
+                    fn(req, res);
+                };
+            };
+
+            const { result: missingSocketFinishCount } = await server.inject('/');
+
+            expect(missingSocketFinishCount).to.be.lessThan(normalFinishCount);
         });
     });
 
@@ -2039,6 +2121,7 @@ describe('Core', () => {
 
             await server.inject('/');
             expect(server.load.eventLoopDelay).to.be.above(0);
+            expect(server.load.eventLoopUtilization).to.be.above(0);
             expect(server.load.heapUsed).to.be.above(1024 * 1024);
             expect(server.load.rss).to.be.above(1024 * 1024);
             await server.stop();

@@ -14,12 +14,13 @@ Build powerful, scalable applications, with minimal overhead and full out-of-the
 - [Version status](https://hapi.dev/resources/status/#hapi) (builds, dependencies, node versions, licenses, eol)
 - [Changelog](https://hapi.dev/resources/changelog/)
 - [Project policies](https://hapi.dev/policies/)
-- [Free and commercial support options](https://hapi.dev/support/)
+- [Support](https://hapi.dev/support/)
 
 ## Technical Steering Committee (TSC) Members
 
  - Devin Ivy ([@devinivy](https://github.com/devinivy))
- - Jonas Pauthier ([@nargonath](https://github.com/nargonath))
  - Lloyd Benson ([@lloydbenson](https://github.com/lloydbenson))
  - Nathan LaFreniere ([@nlf](https://github.com/nlf))
  - Wyatt Lyon Preul ([@geek](https://github.com/geek))
+ - Nicolas Morel ([@marsup](https://github.com/marsup))
+ - Jonathan Samines ([@jonathansamines](https://github.com/jonathansamines))
